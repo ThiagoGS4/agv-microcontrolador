@@ -1,0 +1,10 @@
+dependencies:
+  espressif/esp_wifi_remote:
+    version: '>=0.10,<2.0'
+    rules:
+    - if: target in [esp32p4, esp32h2]
+  pkolt/vl53l0x: ^1.0.0
+  espressif/mqtt: ^1.0.0
+  zorxx/neopixel: '*'
+  espressif/cjson: "^1.7.19"
+  espressif/button: "^4.2.2"
