@@ -185,7 +185,7 @@ TaskHandle_t ColorSensorTaskHandle;
 TaskHandle_t LedTaskHandle;
 
 // controle PID
-static volatile float kp = 2.5f, ki = 0.0f, kd = 0.5f;
+static volatile float kp = 1.5f, ki = 0.0f, kd = 0.5f;
 
 void app_main(void)
 {
@@ -522,13 +522,14 @@ void activateMotors(void *pvParameters){
     while (1){
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+        if(motorCommand == PREV_CMD){
+            motorCommand = prevComd;
+        }
+
         MotorCommand commanOnTask = obstacleDetected ? EMERGENCY_BREAK : motorCommand;
         if ((int)commanOnTask == applied) continue;
         applied = commanOnTask;
 
-        if(motorCommand == PREV_CMD){
-            motorCommand = prevComd;
-        }
 
         // buzzer liga só quando freio de emergência está em ação
         //TODO: reativar essa buzzer depois (funcionando OK!)
@@ -619,15 +620,16 @@ void readLineFollowerSensors(void *pvParameters){
         if (motorCommand == RIGHT || motorCommand == LEFT) {
             int64_t currentTime = esp_timer_get_time() / 1000;
             turningRoutine = true;
-            if (currentTime - turnStartTime > 800) {
-                if (middleNormalized > 600) { 
-                    turningRoutine = false;
-                    motorCommand = PREV_CMD;
-                    if(onBlueSquare){
-                        ignoreBluesquare = true;
-                    }
-                    xTaskNotifyGive(MotorTaskHandle);
+            
+            if (currentTime - turnStartTime > 3000) { 
+                turningRoutine = false;
+                PIDReset();
+                motorCommand = PREV_CMD; // Volta a ir para a frente (ou trás)
+                
+                if(onBlueSquare){
+                    ignoreBluesquare = true; // Levanta o escudo para não frear ao retomar a viagem
                 }
+                xTaskNotifyGive(MotorTaskHandle);
             }
             
             // Pula o resto da task. O PID não roda enquanto estiver virando.
@@ -681,9 +683,9 @@ void readLineFollowerSensors(void *pvParameters){
 
                     int pid = (int)correction;
                     int mag  = pid < 0 ? -pid : pid;
-                    int base = BASE_DUTY - mag / 3;
-                    setDuty(LEFT_CH, BASE_DUTY + pid);
-                    setDuty(RIGHT_CH,  BASE_DUTY - pid);
+                    int base = BASE_DUTY - mag / 4; // todo: deixar isso supimpa
+                    setDuty(LEFT_CH,  base + pid);
+                    setDuty(RIGHT_CH, base - pid);
 
                     if(currPos != OK){
                         motorCommand = FORWARD;
@@ -744,6 +746,7 @@ float PIDController(int measurement, float Kp, float Ki, float Kd){ // uma entra
 }
 
 void PIDReset(){
+    dFilt = 0.0f;
     I  = 0.0f;
     prevError = 0.0f;
 }
@@ -1015,11 +1018,10 @@ void readColorSensor(void *pvParameters){
     TickType_t lastWake = xTaskGetTickCount();
 
     char buffer[16];
-// todo: tirar?
-    // bool onBlueSquare = false;
-    // bool onRedSquare = false;
-    // MODIFICADO: conta leituras seguidas SEM azul (usado para rearmar o onBlueSquare)
+
+    // conta leituras seguidas SEM azul (usado para rearmar o onBlueSquare)
     uint8_t notBlueReads = 0;
+    uint8_t notRedReads = 0;
     
     while(1){
     // função para me ajudar a ler um burst, 8 endereços em sequência:
@@ -1063,13 +1065,22 @@ void readColorSensor(void *pvParameters){
         snprintf(buffer, sizeof(buffer), "%" PRIu16, B_norm);
         esp_mqtt_client_publish(mqttClient, "/agv/color/B", buffer, 0, 0, 0);
 
-        // MODIFICADO: só "rearma" a detecção do azul depois de 3 leituras seguidas (~75 ms) sem azul.
+        // MODIFICADO: durante a virada a cor não decide nada
+        if (motorCommand == RIGHT || motorCommand == LEFT) {
+            vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(COLOR_SENSOR_DELAY));
+            continue;
+        }
+
+        // rearma a detecção do azul depois de 3 leituras seguidas (~75 ms) sem azul.
         // Assim um tremido na borda do quadrado não conta o mesmo quadrado duas vezes.
         if (B_norm >= blueColorLimit && B_norm > R_norm && B_norm > G_norm) {
             notBlueReads = 0;
         } else if (notBlueReads < 3) {
             notBlueReads++;
-            if (notBlueReads == 3) onBlueSquare = false;
+            if (notBlueReads == 3){
+                onBlueSquare = false;
+                ignoreBluesquare = false;
+            } 
         }
 
         if (motorCommand == STAY && R_norm >= redColorLimit && R_norm > G_norm && R_norm > B_norm) {
@@ -1077,22 +1088,27 @@ void readColorSensor(void *pvParameters){
             continue;
         }
 
-        if (!(R_norm >= redColorLimit && R_norm > G_norm && R_norm > B_norm)) onRedSquare = false;
+        if (R_norm >= redColorLimit && R_norm > G_norm && R_norm > B_norm) {
+            notRedReads = 0;
+        } else if (notRedReads < 3) {
+            notRedReads++;
+            if (notRedReads == 3) onRedSquare = false;
+        }
 
         // análise das variáveis e atribuição das funções de cada cor
-        if(R_norm >= colorLimit && G_norm >= colorLimit && B_norm >= colorLimit && roomSquareCounter > 0){
+        if(R_norm >= colorLimit && G_norm >= colorLimit && B_norm >= colorLimit){
             ESP_LOGI(TAG, "\037[0;37mWHITE: %" PRIu16, R_norm + G_norm + B_norm);
             motorCommand = FORWARD;
             xTaskNotifyGive(MotorTaskHandle);
-        } else if(R_norm >= redColorLimit && R_norm > G_norm && R_norm > B_norm){
-            motorCommand = BREAK_MOTORS;
-            xTaskNotifyGive(MotorTaskHandle);
-            if(!onRedSquare){
-                onRedSquare = true;
-                esp_mqtt_client_publish(mqttClient, "/agv/atBase", "1", 0, 0, 0);
+            } else if(R_norm >= redColorLimit && R_norm > G_norm && R_norm > B_norm){
+                // MODIFICADO: freia só na ENTRADA do vermelho (antes: a cada 25 ms)
+                if(!onRedSquare){
+                    onRedSquare = true;
+                    motorCommand = BREAK_MOTORS;
+                    xTaskNotifyGive(MotorTaskHandle);
+                    esp_mqtt_client_publish(mqttClient, "/agv/atBase", "1", 0, 0, 0);
+                }
             }
-
-        } 
         // else if(G_norm >= greenColorLimit && G_norm > R_norm && G_norm > B_norm){
         //     //TODO: colocar função do verde
         //     motorCommand = BREAK_MOTORS;
@@ -1102,29 +1118,35 @@ void readColorSensor(void *pvParameters){
         // MODIFICADO: o AGV NÃO vira mais para entrar nas salas. Agora ele só conta os quadrados azuis
         // (roomSquareCounter) e, quando chega no desejado (counter == 0), para e bipa, igual ao vermelho
         // (BREAK_MOTORS -> LED vermelho piscando; duplo clique no botão -> STAY).
-        else if(B_norm >= blueColorLimit &&  B_norm > R_norm && B_norm > G_norm){
-            if(!onBlueSquare){ // MODIFICADO: só age na ENTRADA do quadrado (1x por quadrado)
-                ignoreBluesquare = false; // tira comando de ignorar ao virar
-                onBlueSquare = true;
-                // MODIFICADO: conta ESTE quadrado primeiro (decrementa antes de decidir).
-                if(roomSquareCounter > 0){
-                    roomSquareCounter--;
-                    snprintf(buffer, sizeof(buffer), "%d", roomSquareCounter);
-                    esp_mqtt_client_publish(mqttClient, "/agv/squarePassed", buffer, 0, 0, 0);
+            else if(B_norm >= blueColorLimit &&  B_norm > R_norm && B_norm > G_norm){
+                if(!onBlueSquare){
+                    onBlueSquare = true;
+
+                    // Se o escudo estiver ativo (acabou de virar 180°), passa direto e consome o escudo
+                    if (ignoreBluesquare) {
+                        ignoreBluesquare = false;
+                        motorCommand = FORWARD;
+                        xTaskNotifyGive(MotorTaskHandle);
+                    } 
+                    // Navegação normal
+                    else {
+                        if(roomSquareCounter > 0){
+                            roomSquareCounter--;
+                            snprintf(buffer, sizeof(buffer), "%d", roomSquareCounter);
+                            esp_mqtt_client_publish(mqttClient, "/agv/squarePassed", buffer, 0, 0, 0);
+                        }
+                        if(roomSquareCounter > 0){
+                            motorCommand = FORWARD;
+                            xTaskNotifyGive(MotorTaskHandle);
+                        } else {
+                            motorCommand = BREAK_MOTORS;
+                            xTaskNotifyGive(MotorTaskHandle);
+                            beepBuzzer(3, 150, 100);
+                            lastWake = xTaskGetTickCount();
+                        }
+                    }
                 }
-                if(roomSquareCounter > 0){
-                    // MODIFICADO: ainda faltam quadrados -> segue andando
-                    motorCommand = FORWARD;
-                    xTaskNotifyGive(MotorTaskHandle);
-                } else {
-                    // MODIFICADO: contador chegou a 0 -> para (igual ao vermelho) e bipa
-                    motorCommand = BREAK_MOTORS;
-                    xTaskNotifyGive(MotorTaskHandle);
-                    beepBuzzer(3, 150, 100);
-                    lastWake = xTaskGetTickCount();
-                }
-            }
-        } 
+        }
         else {
             if(!turningRoutine){
                 motorCommand = FORWARD;
@@ -1217,6 +1239,11 @@ void extractAndAssignWebCommands(char* responseJSON, int dataLen){
     lastTripSquareCounter = roomSquareCounter;
     agvDirection = agvDirectionExtracted->valueint;
     roomDirection = roomDirectionExtracted->valueint;
+
+    if (roomSquareCounter > 0 && (motorCommand == BREAK_MOTORS || motorCommand == STAY)) {
+        motorCommand = FORWARD;
+        xTaskNotifyGive(MotorTaskHandle);
+    }
 }
 
 #define DEBOUNCE_TIME 100
@@ -1251,9 +1278,14 @@ void configButton() {
 }
 static void button_single_click_cb(void *btn_handle, void *usr_data) {
     beepBuzzer(1, 150, 100);
-    motorCommand = FORWARD; // instrução a ser resgatada após rotina de virar
-    motorCommand = RIGHT;
-    xTaskNotifyGive(MotorTaskHandle);
+    // MODIFICADO: só vale parado e com uma viagem para desfazer
+    if (motorCommand == BREAK_MOTORS && lastTripSquareCounter > 0) {
+        roomSquareCounter = lastTripSquareCounter;   // mesma contagem, sentido contrário
+        lastTripSquareCounter = 0;                   // consumida: um 2º clique não faz nada
+        turnStartTime = esp_timer_get_time() / 1000; // arma o tempo mínimo da virada
+        motorCommand = RIGHT;
+        xTaskNotifyGive(MotorTaskHandle);
+    }
     ESP_LOGI(TAG, "BUTTON_SINGLE_CLICK");
 }
 
