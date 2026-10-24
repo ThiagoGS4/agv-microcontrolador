@@ -22,9 +22,10 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
-  "idf.port": "detect",
+  "idf.port": "/dev/ttyUSB0",
   "idf.currentSetup": "/home/Garcola/esp/v6.0.2/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
-  }
+  },
+  "idf.flashType": "UART"
 }
